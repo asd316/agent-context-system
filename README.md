@@ -10,6 +10,10 @@ SQLite 索引 + CLI，全部本地运行。
 ![SQLite FTS5](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green)
 
+![Node index](docs/images/node-index-explore.jpg)
+
+*Node index：本机知识库、项目与 Skill 织成的有向图；Agent 从顶层入口按需下探。*
+
 </div>
 
 ## 和你有什么关系
@@ -18,13 +22,13 @@ SQLite 索引 + CLI，全部本地运行。
 
 Agent Context System 在本地维护一张**全局信息地图**（节点索引）：Agent 先拿到有限入口，再按需向下探索——不必把整盘塞进上下文，也不必你每次手把手指路。
 
-![一次会话：Agent 自己从全局地图里找东西](docs/images/session-usage.png)
+![一次会话：Agent 先读全局信息地图](docs/images/session-usage.png)
 
-*一次会话：你只说「做什么」；Agent 先读本地全局信息地图，自己找到相关经验、资料和 skill，再动手。*
+*一次会话：Agent 先读全局信息地图，再自己找经验、资料与 skill，不必你指派细节。*
 
-![错误会回流成经验 · 地图可自动维护](docs/images/feedback-loop.png)
+![过程遇错可回流经验；会话自动维护全局信息](docs/images/feedback-loop.png)
 
-*用得越多，地图越记得「什么管用、什么是坑」；错误会写回经验，会话里也能自动问清并维护入口——不必另开一份文档工。*
+*过程遇错可回流经验；会话会自动询问、自动维护全局信息，你仍定方向。*
 
 **四件事（按优先级）：**
 
@@ -43,10 +47,6 @@ Agent Context System 维护一个**全局节点索引**：每个节点是信息�
 
 - **全局节点索引**：SQLite + FTS5 trigram；Reference / Knowledge / Project / Skill 四层组成有向无环图；挂载路径仍指向磁盘原文
 
-  ![Node index（脱敏示意）](docs/images/node-index-explore.jpg)
-
-  *Node index：本机 Knowledge / Project / Skill / Reference 织成的可下探图（脱敏示意）。*
-
 - **干活 Agent 接口**：注入顶层 Index 树；`search`（关键词搜节点）、`children`（展开一层）、`ancestors`（回溯到根的完整路径）、`get`（读节点与挂载物路径）；均支持 `--json`
 
 - **Build & Activate**：把 Index 树与 Router skill 生成并安装进各 AI Client 的规则文件与 skill 目录（Claude Code、Codex、Gemini CLI、Cursor 等）
@@ -54,8 +54,6 @@ Agent Context System 维护一个**全局节点索引**：每个节点是信息�
 - **维护控制台（星图 + Organize …）**：`ui/console/` 供人看图、归类、审 Inbox；Explore 星图与 Organize / Profiles / Lessons 等页是**维护面**，不是产品的唯一价值
 
   ![维护控制台 Organize](docs/images/node-index-organize.png)
-
-  *维护控制台（Organize）：人来归类与整理；产品价值不在「又一个星图网站」。*
 
 - **全部本地**：数据在 `~/.local/share/node-index/index.db`，摘要接口自己配，不依赖任何云服务
 
