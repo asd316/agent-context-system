@@ -1,0 +1,30 @@
+# 注入给 agent 的提示词文档的文字部分 (DSH 经 ~/.dsh/AGENTS.md 软链读取生成结果)。
+# 改完运行:  bin/node-index render --depth 2   (每天 07:00 的流水线也会重新生成)
+# 占位符:  {depth} = 树展开的层数
+# 结构固定为: 标题 → 开头 → 命令 → 说明 → 树 (树由数据库生成,不在此处写)。
+# 字段缺失或不是预期类型会直接报错,不会悄悄回退到内置文字。
+
+title: 节点索引
+
+intro: 这是用户知识库、项目和 Skill 的目录。先看下面的树,需要细节时再用命令行深入。
+
+commands_heading: 命令
+commands:
+  - cmd: "node-index search <词>"
+    desc: 关键词搜索,返回命中节点及其所属的最上层节点
+  - cmd: "node-index children <id>"
+    desc: 展开一层子节点
+  - cmd: "node-index ancestors <id>"
+    desc: 从最上层到该节点的全部路径
+  - cmd: "node-index get <id>"
+    desc: 读取单个节点,path 字段是挂载物的磁盘位置
+commands_footer: 加 `--json` 得到结构化输出
+
+notes_heading: 说明
+notes:
+  - 📎 表示该节点挂载了文件或文件夹,可用 `get` 取路径后直接阅读。
+  - ⚠ 表示挂载路径已失效。
+  - "`→ 见 nX` 表示该节点同时出现在多个位置,完整子树在 nX 之下。"
+  - 下面的树只展开到第 {depth} 层,更深的内容用 `children` 展开。
+
+tree_heading: 树

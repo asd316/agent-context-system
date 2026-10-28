@@ -1,0 +1,2180 @@
+openapi: 3.1.0
+info:
+  title: node-index 操作契约
+  version: 0.1.0
+  description: |
+    node-index 对外暴露的全部操作及其输入输出的契约,用来约束 CLI 实现与调用方 (干活 agent、维护 agent、人)。
+
+    **这不是 HTTP 服务。** node-index 是本地命令行。这里借用 OpenAPI 的格式:
+    - 每个 path + method 对应一条命令,命令行写在 `x-cli.command`。
+    - 参数对应命令行参数;`--json` 时 stdout 必须符合 responses 里的 schema。
+    - HTTP 状态码只是错误类别的标签,真实表现为进程退出码 (`x-cli.exit-codes`)。
+    - 以后若要包一层 MCP 或 HTTP,直接复用这份契约。
+
+    表结构以 `src/schema.sql` 为准;与本文冲突时,先对齐再改代码。
+
+    本契约已于 2026-10-17 经用户确认定稿;改动需先与用户对齐,并同步更新 CLI 与 tests/test_contract.py。
+
+    **P3 扩展 (2026-10-23)**: 按 agent-context-system 的 Data-Model 新增 Shared config 相关命令 (report、inbox、lesson、catalog、category、build、activate、apply) 与网页后端的 HTTP 接口 (`/api/...`)。原 `report` (覆盖率统计) 改名为 `coverage`。约定:
+    - `x-unimplemented: true`: 契约已定、实现未到。tests/test_contract.py 跳过这些操作的「CLI 命令存在」与「目录限制」检查。实现某条命令时删掉这个标记,并在测试里补上它的调用参数与输出校验。
+    - `x-http: true`: 真实的 HTTP 接口,由网页后端提供,不对应 CLI 命令,没有 `x-cli`。写接口与 CLI 调用同一批函数。
+  x-cli:
+    binary: node-index
+    exit-codes:
+      "0": 成功
+      "2": 参数不合法 (400/422)
+      "3": 对象不存在 (404)
+      "4": 冲突,如成环、路径已被挂载 (409)
+      "5": 不允许,如不在维护目录内执行写命令 (403)
+      "6": 外部步骤失败,如 apply 的 git commit 失败 (500)
+    global-flags:
+      --json: 输出 JSON,否则输出人读文本 (tree 默认输出缩进文本)
+      --db: 数据库文件路径,默认 ~/.local/share/node-index/index.db (环境变量 NODE_INDEX_DB 同效,命令行优先)
+      --scope: 收录范围清单路径,默认 <仓库>/config/scope.yml。清单的 host_roots 为 true 时再接上 host/host.yml 的 scan_roots
+      --no-count: get/children/ancestors 不累加访问计数 (环境变量 NODE_INDEX_NO_COUNT=1 同效)
+servers:
+  - url: cli://node-index
+tags:
+  - name: read
+    description: 读命令。任何 agent 在任何目录都可执行,是写进全局提示词的唯一部分。get / children / ancestors 的唯一副作用是把访问事件追加到暂存文件,读命令本身不写库 (库不存在时新建空库除外);计数 (hits、last_access) 在 ingest-access 并入时才生效。追加失败不影响命令结果,search 与 tree 不计数。
+  - name: write
+    description: 写命令。只在仓库根目录内允许 (按当前工作目录判断),否则退出码 5。
+  - name: maintenance
+    description: 维护 agent 的批量动作,属于写命令。
+  - name: agent-write
+    description: agent 日常用的写命令 (report、lesson add、inbox claim、inbox resolve)。任何目录都可执行,写入 CLI 所在仓库的 shared/,与当前目录无关。
+  - name: http
+    description: 网页后端 (只监听 127.0.0.1) 的 HTTP 接口,见 x-http。
+
+paths:
+  /search:
+    get:
+      tags: [read]
+      operationId: search
+      summary: 关键词搜索,并返回每个命中节点所属的最上层节点
+      x-cli:
+        command: node-index search <query> [--limit N]
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema: { type: string, minLength: 1 }
+          description: 搜索词。不少于 3 个字符走 FTS5 trigram;1–2 个字符走 LIKE 兜底。匹配 名称、层级摘要、内容摘要。
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: 命中列表,可为空
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/SearchHit" }
+        "400": { $ref: "#/components/responses/BadInput" }
+
+  /nodes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    get:
+      tags: [read]
+      operationId: getNode
+      summary: 读取单个节点的全部字段
+      x-cli:
+        command: node-index get <id>
+      responses:
+        "200":
+          description: 节点
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Node" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [write]
+      operationId: updateNode
+      summary: 修改节点字段;修改路径会重新检查并把路径状态置为 ok
+      x-cli:
+        command: node-index set <id> [--name ..] [--category ..] [--hier-summary ..] [--content-summary ..] [--status ..] [--path ..] --actor human|ai
+      description: |
+        摘要来源规则: `actor=ai` 不得覆盖来源为 human 的摘要,否则退出码 4。
+        写入的摘要超长时直接拒绝 (退出码 2),不自动截断。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NodeUpdate" }
+      responses:
+        "200":
+          description: 更新后的节点
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Node" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    delete:
+      tags: [write]
+      operationId: deleteNode
+      summary: 删除节点
+      x-cli:
+        command: node-index rm <id> [--detach] --actor human|ai
+      description: |
+        节点仍有边时默认拒绝 (退出码 4);带 `detach` 才会先移除它的所有边。
+        `actor=ai` 一律拒绝 (退出码 5)。
+      parameters:
+        - name: detach
+          in: query
+          schema: { type: boolean, default: false }
+        - $ref: "#/components/parameters/Actor"
+      responses:
+        "204": { description: 已删除 }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /nodes:
+    post:
+      tags: [write]
+      operationId: createNode
+      summary: 新建节点,可同时挂到若干父节点下
+      x-cli:
+        command: node-index add --name .. --category .. [--hier-summary ..] [--path ..] [--status ..] [--parent <id>]... --actor human|ai
+      description: |
+        `actor=ai` 创建的节点 `pending=true`;`actor=human` 为 false。
+        指定 parents 时建立的边: actor=human 为 manual,actor=ai 记为 scan (表示非人工建立,可被 ai 日后调整)。
+        指定 path 时,必须是磁盘上存在的文件或文件夹,路径种类自动判定;该路径已被其他节点挂载则退出码 4。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NodeCreate" }
+      responses:
+        "201":
+          description: 新节点
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Node" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /nodes/{id}/confirm:
+    post:
+      tags: [write]
+      operationId: confirmNode
+      summary: 确认待确认节点 (pending 置 false)
+      x-cli:
+        command: node-index confirm <id>
+      parameters:
+        - $ref: "#/components/parameters/NodeId"
+      responses:
+        "200":
+          description: 更新后的节点
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Node" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /nodes/{id}/confirm-subtree:
+    post:
+      tags: [write]
+      operationId: confirmSubtree
+      summary: 批量确认 (该节点及其全部后代的 pending 置 false)
+      description: 用于按根、按目录审核。只改 pending,其余字段不变;已确认的节点不计入 confirmed。
+      x-cli:
+        command: node-index confirm <id> --subtree
+      parameters:
+        - $ref: "#/components/parameters/NodeId"
+      responses:
+        "200":
+          description: 确认结果
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [root, confirmed]
+                properties:
+                  root: { type: string, pattern: "^n[0-9]+$" }
+                  confirmed: { type: integer, minimum: 0, description: 本次由待确认改为已确认的节点数 }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /nodes/{id}/children:
+    get:
+      tags: [read]
+      operationId: listChildren
+      summary: 展开一层子节点,按名称排序
+      x-cli:
+        command: node-index children <id>
+      parameters:
+        - $ref: "#/components/parameters/NodeId"
+      responses:
+        "200":
+          description: 子节点简要信息
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/NodeBrief" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /nodes/{id}/ancestors:
+    get:
+      tags: [read]
+      operationId: listAncestorPaths
+      summary: 列出从最上层节点到该节点的全部路径 (多父节点时可有多条)
+      x-cli:
+        command: node-index ancestors <id>
+      parameters:
+        - $ref: "#/components/parameters/NodeId"
+      responses:
+        "200":
+          description: 每条路径是自上而下的节点简要信息列表,最后一项是该节点自己
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/NodeBrief" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /tree:
+    get:
+      tags: [read]
+      operationId: exportTree
+      summary: 导出深度为 N 的树,供写入全局提示词
+      x-cli:
+        command: node-index tree --depth N [--root <id>] [--json]
+      description: |
+        默认输出缩进文本,每行格式:
+        `<id> <名称> [📎] [⚠] — <层级摘要>`
+        📎 表示有挂载物;⚠ 表示路径失效。缩进两个空格表示一层。
+        同级按名称排序。一个节点有多个父节点时,只在字典序最先的父节点下完整展开,
+        其他父节点下输出 `<id> <名称> → 见 <规范父节点 id>`,不再展开其子树。
+        “字典序最先”按父节点的 (名称, id) 比较。若规范父节点不在本次导出的子树内,则在遇到的第一个位置完整展开。
+        不带 `root` 时从所有最上层节点 (没有父节点的节点) 开始。深度 1 表示只含最上层节点自己。
+        文本输出不含内容摘要。
+      parameters:
+        - name: depth
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1, maximum: 10 }
+        - name: root
+          in: query
+          schema: { $ref: "#/components/schemas/NodeId" }
+      responses:
+        "200":
+          description: 树
+          content:
+            text/plain:
+              schema: { type: string }
+              example: |
+                n1 知识库 📎 — 我所有的笔记与设计资料
+                  n2 设计 📎 — 设计原则与案例
+                n10 Skill — 可复用的做事方法
+                  n11 调研 — 各类调研方法
+                    n12 调研视频 📎 — 看视频做调研的流程
+                n20 项目 — 正在做的项目
+                  n21 内容生产 — 内容产出类项目
+                    n12 调研视频 → 见 n11
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/TreeNode" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /coverage:
+    get:
+      tags: [read]
+      operationId: coverage
+      summary: 验收与维护状况统计 (2026-10-23 前命令名为 report)
+      x-cli:
+        command: node-index coverage [--json]
+      description: |
+        对照 scope.yml 扫描磁盘 (只读),用于检验“范围内、深度以内的每个路径至少被一个节点挂载,或被清单明确排除”。
+      responses:
+        "200":
+          description: 统计
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Coverage" }
+
+  /edges:
+    post:
+      tags: [write]
+      operationId: linkNodes
+      summary: 建立父子边
+      x-cli:
+        command: node-index link <parent> <child> --actor human|ai
+      description: 成环 (含自环) 退出码 4。`actor=human` 的边来源为 manual,`scan` 命令建立的边来源为 scan;`actor=ai` 经此命令建立的边不允许,请用 scan。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EdgeRef" }
+      responses:
+        "201":
+          description: 已建立
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Edge" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    delete:
+      tags: [write]
+      operationId: unlinkNodes
+      summary: 移除父子边
+      x-cli:
+        command: node-index unlink <parent> <child> --actor human|ai
+      description: 来源为 manual 的边,`actor=ai` 不得移除 (退出码 5)。
+      parameters:
+        - name: parent
+          in: query
+          required: true
+          schema: { $ref: "#/components/schemas/NodeId" }
+        - name: child
+          in: query
+          required: true
+          schema: { $ref: "#/components/schemas/NodeId" }
+        - $ref: "#/components/parameters/Actor"
+      responses:
+        "204": { description: 已移除 }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /maintenance/ingest-access:
+    post:
+      tags: [maintenance]
+      operationId: ingestAccess
+      summary: 把暂存文件里的访问事件并入数据库 (node_access 计数与 access_log 明细)
+      x-cli:
+        command: node-index ingest-access
+      description: |
+        读命令只把事件追加到暂存文件 (默认 /tmp/node-index-access.jsonl,环境变量 NODE_INDEX_SPOOL 可改;指定了非默认库时为 <库>.spool),
+        不写库,以免读命令等待写锁。本命令是唯一的并入途径,由每日流水线第一步调用;并入前若库缺访问表 (老库) 会先补建。
+        拿不到写锁或库只读时事件原样保留,返回 0。损坏的行跳过。
+      responses:
+        "200":
+          description: 并入的事件数
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ingested]
+                properties:
+                  ingested: { type: integer }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /maintenance/check:
+    post:
+      tags: [maintenance]
+      operationId: checkPaths
+      summary: 检查所有挂载路径是否仍存在,更新路径状态与检查时间
+      x-cli:
+        command: node-index check
+      description: 只标记 (ok/missing),不删除节点,不自动提议新路径。
+      responses:
+        "200":
+          description: 本次检查结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [checked, missing]
+                properties:
+                  checked: { type: integer }
+                  missing:
+                    type: array
+                    items: { $ref: "#/components/schemas/NodeBrief" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /maintenance/scan:
+    post:
+      tags: [maintenance]
+      operationId: scan
+      summary: 按 scope.yml 扫描磁盘,为新增路径建立待确认节点
+      x-cli:
+        command: node-index scan [--dry-run]
+      description: |
+        只建节点和 scan 来源的边,不改已有节点。新节点 `pending=true`,类别继承所属根的类别,
+        层级摘要为空,待维护 agent 补写。`dry-run` 只返回将会新建的内容。
+      parameters:
+        - name: dry-run
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: 非 dry-run 时返回 created (已新建的节点);dry-run 时返回 would_create (将新建的内容,此时还没有 id)。二者只出现一个。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  created:
+                    type: array
+                    items: { $ref: "#/components/schemas/NodeBrief" }
+                  categories:
+                    type: object
+                    description: |
+                      scope 含 shared/skills 根时才有: 把 shared/categories.yaml 写进本机库的结果。
+                      每个 Category 一个无挂载物的 Skill 节点,挂在 shared/skills 根节点下,成员挂在它下面;
+                      Category 节点的边以文件为准 (origin=scan)。unresolved 是找不到本机节点的成员 (`<category>: <member>`)。
+                    required: [created, renamed, removed, linked, unlinked, unresolved]
+                    properties:
+                      created: { type: array, items: { $ref: "#/components/schemas/CategoryId" } }
+                      renamed: { type: array, items: { $ref: "#/components/schemas/CategoryId" } }
+                      removed: { type: array, items: { $ref: "#/components/schemas/CategoryId" } }
+                      linked: { type: integer }
+                      unlinked: { type: integer }
+                      unresolved: { type: array, items: { type: string } }
+                  would_create:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, category, path, path_kind, parent_path]
+                      properties:
+                        name: { type: string }
+                        category: { $ref: "#/components/schemas/Category" }
+                        path: { type: string }
+                        path_kind: { $ref: "#/components/schemas/PathKind" }
+                        parent_path: { type: [string, "null"] }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /maintenance/render:
+    post:
+      tags: [maintenance]
+      operationId: renderPromptDoc
+      summary: 生成供 agent 加载的提示词文档 (树 + CLI 简要用法)
+      x-cli:
+        command: node-index render --depth N [--out <file>]
+      description: |
+        默认写入 ~/.local/share/node-index/ 下的生成文档,返回写入路径。
+        文档的文字部分(标题、开头、命令说明、符号说明)读自 `config/prompt.yml`,缺失或格式不对时报 bad_input(exit 2),不回退到内置文字;树由数据库生成。
+        内容与已有文件完全相同时**不重写文件** (保持修改时间不变,避免读取该文件的 agent 被无谓地重新注入),此时 `changed` 为 false。
+      parameters:
+        - name: depth
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1, maximum: 10 }
+        - name: out
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: 已写入
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path, bytes]
+                properties:
+                  path: { type: string }
+                  bytes: { type: integer }
+                  changed: { type: boolean, description: 本次是否真的写了文件 }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /maintenance/layer:
+    post:
+      tags: [maintenance]
+      operationId: applyLayerPlan
+      summary: 按分层方案文件批量建立分类节点并挂载已有节点
+      x-cli:
+        command: node-index layer --plan <plan.json> [--dry-run] [--detach]
+      description: |
+        读取分层方案 (plan 文件: root、groups、skills、可选 detach_from),建立
+        「大类 → 子类 → 节点」。分类节点是**纯目录节点**: 不挂载文件,类别取自根节点,来源为 human (不待确认),层级摘要留空,事后由 `summarize` 生成。
+
+        **根节点 `root` 有三种写法:**
+        - 字符串: 名称,必须是库里恰有一个的、无父节点的节点 (否则退出码 2)。
+        - `{"name": ..}`: 同上,但可再带 `create: {category, adopt_roots}`——名称不存在时**新建**这个根 (纯目录节点,类别取 `create.category`),并把 `adopt_roots` 列出的现有挂载节点 (按名称,且类别须与根相同,须各恰有一个) 挂到它下面。根已存在时只补建缺失的 adopt 边。
+        - `{"path": ..}`: 以挂载该路径的节点为分层起点,它可以有父节点 (用于只给某个文件夹下的子节点分层)。
+
+        **规则:**
+        - 只有一个子类的大类不再建同名子类,节点直接挂大类。该判断依据方案里定义的子类数,不依据实际用到的数量。主分类为 `ZZ` 的节点不动。
+        - 每个节点最多两条新边: 主分类与可选的次要分类,来源均为 manual。
+        - 节点按名称查找: 先在根的直接子节点和各 `adopt_roots` 的直接子节点里找,找不到再到根的全部后代里找 (已被移走的情形)。找不到记入 skipped;同名多个则退出码 2。
+        - `detach`: 对已被归类的节点,移除它与 `detach_from` 所列名称的父节点之间的原有边;方案没写 `detach_from` 时,移除它与根节点之间的边。未被归类的节点保持原样,仍在原父节点下。`--detach-root` 是它的旧写法,仍可用。
+        - 幂等: 同一父节点下已有同名分类节点就复用;已存在的边不重复建。重跑不产生任何新节点或边。
+        - `dry-run`: 不写库,返回将要发生的数量,不要求在维护目录内执行。预演与真实应用的数字必须一致。
+        - 方案格式不合法、根或 adopt 节点找不到/不唯一、待归类节点重名,都在写入任何内容之前以退出码 2 拒绝,保证要么全部应用要么不动。
+      parameters:
+        - { name: plan, in: query, required: true, schema: { type: string } }
+        - { name: dry-run, in: query, schema: { type: boolean, default: false } }
+        - { name: detach, in: query, schema: { type: boolean, default: false } }
+      responses:
+        "200":
+          description: 应用结果 (dry-run 时数量为预计值;新建的根也计入 created_nodes,adopt 与分类挂载的边计入 linked)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [created_nodes, linked, detached, skipped, dry_run]
+                properties:
+                  dry_run: { type: boolean }
+                  created_nodes:
+                    type: array
+                    description: 新建 (dry-run 时为将新建) 的分类节点名,含其父节点名;新建的根其 parent 为空字符串
+                    items:
+                      type: object
+                      required: [name, parent]
+                      properties:
+                        name: { type: string }
+                        parent: { type: string }
+                  linked: { type: integer, description: 新建的边数 }
+                  detached: { type: integer, description: 被移除的旧边数 }
+                  skipped:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, reason]
+                      properties:
+                        name: { type: string }
+                        reason: { type: string }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /maintenance/summarize:
+    post:
+      tags: [maintenance]
+      operationId: summarize
+      summary: 调用 DeepSeek (OpenAI 兼容接口) 为节点生成层级摘要与内容摘要
+      x-cli:
+        command: node-index summarize [--ids n1,n2] [--limit N] [--force] [--dry-run] [--workers N] [--env <file>]
+      description: |
+        连接信息读自仓库根的 `.env` (OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL);密钥不会出现在任何输出里。
+        目标: 层级摘要为空的节点;有挂载物但没有内容摘要或内容摘要已过期的节点。`force` 额外重写已有的 ai 摘要。
+        SOP 文件 (`reference/sops/*.md`) 在内容摘要要重写、且层级摘要不是人写的时,同一次回复里的层级摘要一并写入,并在结果的 `sop_hier` 里列出。其他节点的已有层级摘要不因此重写。
+        来源为 human 的摘要永远不覆盖。写入走与 `set --actor ai` 相同的校验: 层级摘要 ≤ 40 字、内容摘要 ≤ 200 字,
+        超长则带反馈让模型重写,仍不合格就记入 failed,不截断。新生成的摘要来源记为 ai,节点的待确认状态不变。
+        不设费用上限;`limit` 为 0 或不填表示不限 (未传 `--limit` 时读 .env 的 SUMMARY_MAX_PER_RUN,0 或缺省为不限)。
+        内容摘要是否过期: 挂载物的"有效修改时间"晚于摘要记录的时间。文件的有效修改时间就是文件本身的修改时间;**文件夹**取「文件夹自身」与「其说明文档 (SKILL.md、README.md、README、AGENTS.md、CLAUDE.md 中存在的那些)」修改时间的最大值——因为改动文件夹里的文件不会改变文件夹自身的修改时间,只看后者会漏掉内容更新。`coverage` 的 `stale_content_summaries` 使用同一口径。
+        每个节点写入后立即落库,中途中断可直接重跑,只会处理剩下的。
+        `dry-run` 不需要 .env,不调用模型,不要求在维护目录内执行。
+      parameters:
+        - { name: ids, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 0 } }
+        - { name: force, in: query, schema: { type: boolean, default: false } }
+        - { name: dry-run, in: query, schema: { type: boolean, default: false } }
+        - { name: workers, in: query, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: 非 dry-run 返回 ok/failed/skipped;dry-run 返回 target_ids 与 sample_prompt
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [targets]
+                properties:
+                  targets: { type: integer }
+                  sop_hier:
+                    type: array
+                    description: 这次写入了层级摘要的 SOP 节点。每日流水线据此决定要不要 build。
+                    items: { $ref: "#/components/schemas/NodeId" }
+                  ok:
+                    type: array
+                    items: { $ref: "#/components/schemas/NodeId" }
+                  failed:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, reason]
+                      properties:
+                        id: { $ref: "#/components/schemas/NodeId" }
+                        reason: { type: string }
+                  skipped:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, reason]
+                      properties:
+                        id: { $ref: "#/components/schemas/NodeId" }
+                        reason: { type: string }
+                  target_ids:
+                    type: array
+                    items: { $ref: "#/components/schemas/NodeId" }
+                  sample_prompt: { type: [string, "null"] }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /maintenance/snapshot:
+    post:
+      tags: [maintenance]
+      operationId: writeSnapshot
+      summary: 导出 JSONL 快照到仓库 snapshots/ 目录
+      x-cli:
+        command: node-index snapshot [--out <file>]
+      description: 每个节点一行;边以 parents 数组附在节点行上。只用于备份与人工审阅。默认写 <仓库>/snapshots/<host>.jsonl,host 取 host/host.yml (不存在时退出码 2)。内容与已有文件完全相同时不重写文件,`changed` 为 false。
+      parameters:
+        - name: out
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: 已写入
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path, nodes]
+                properties:
+                  path: { type: string }
+                  nodes: { type: integer }
+                  changed: { type: boolean, description: 本次是否真的写了文件 }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ---- P3: Shared config 相关命令 ----
+
+  /reports:
+    post:
+      tags: [agent-write]
+      operationId: createReport
+      summary: 新建一条 Report,写入 shared/inbox/<id>.yaml,status 为 pending
+      x-cli:
+        command: node-index report <kind> --title .. --reason .. --evidence .. --client .. --position orchestrator|executor [--target <path> (--diff <file|-> | --old <text> --new <text>)]
+      description: |
+        任何目录都可执行,写入本仓库的 shared/inbox/。`from.host` 取 host/host.yml 的 `host`;host.yml 不存在时退出码 2。
+        带 `--target` 即为 Proposal,`change.diff` 取自 `--diff` 指定的文件 (`-` 为标准输入),或由 `--old`/`--new` 组成 `change.replace`。
+        kind 为 `rule-change` 而没有 change,退出码 2。kind 为 `digest` 只由 Digest 生成,agent 不应手动使用。
+      parameters:
+        - name: kind
+          in: query
+          required: true
+          schema: { $ref: "#/components/schemas/ReportKind" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, reason, evidence, client, position]
+              properties:
+                title: { type: string, minLength: 1 }
+                reason: { type: string, minLength: 1 }
+                evidence: { type: string, minLength: 1 }
+                client: { type: string, minLength: 1 }
+                position: { $ref: "#/components/schemas/Position" }
+                change: { $ref: "#/components/schemas/ReportChange" }
+      responses:
+        "201":
+          description: 新建的 Report
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Report" }
+        "400": { $ref: "#/components/responses/BadInput" }
+
+  /inbox:
+    get:
+      tags: [read]
+      operationId: listInbox
+      summary: 列出 Report,按 at 倒序
+      x-cli:
+        command: node-index inbox list [--status pending|in-progress|resolved|rejected]... [--kind <kind>]
+      description: 不带 `--status` 时列出 pending 与 in-progress。
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: array
+            items: { $ref: "#/components/schemas/ReportStatus" }
+        - name: kind
+          in: query
+          schema: { $ref: "#/components/schemas/ReportKind" }
+      responses:
+        "200":
+          description: Report 摘要列表,可为空
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ReportBrief" }
+
+  /inbox/{reportId}:
+    parameters:
+      - $ref: "#/components/parameters/ReportId"
+    get:
+      tags: [read]
+      operationId: showReport
+      summary: 读取一条 Report 的全部字段
+      x-cli:
+        command: node-index inbox show <id>
+      responses:
+        "200":
+          description: Report
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Report" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /inbox/{reportId}/claim:
+    parameters:
+      - $ref: "#/components/parameters/ReportId"
+    post:
+      tags: [agent-write]
+      operationId: claimReport
+      summary: 把 Report 标为 in-progress,记录 claimed_by
+      x-cli:
+        command: node-index inbox claim <id> --client ..
+      description: |
+        幂等: 已被同一 Client 认领时原样返回。已被其他 Client 认领,或已 resolved/rejected,退出码 4。
+      parameters:
+        - name: client
+          in: query
+          required: true
+          schema: { type: string, minLength: 1 }
+      responses:
+        "200":
+          description: 更新后的 Report
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Report" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /inbox/{reportId}/resolve:
+    parameters:
+      - $ref: "#/components/parameters/ReportId"
+    post:
+      tags: [agent-write]
+      operationId: resolveReport
+      summary: 填写 resolution,并向 shared/decisions.jsonl 追加一行
+      x-cli:
+        command: node-index inbox resolve <id> --status resolved|rejected --decided-by .. [--instruction <用户原话>] [--outcome as-proposed|modified|superseded] [--change <提交或文件>]... --by <client> [--session <会话 id>]
+      description: |
+        `--status resolved` 时 `--outcome` 必填且为 as-proposed 或 modified;`rejected` 时 `--outcome` 只能不带或为 `superseded` (被另一个决定整体取代,不是否定建议本身),且必须带 `--instruction` (驳回理由),否则退出码 2。
+        Report 已是 resolved/rejected,或已被 `--by` 以外的 Client 认领 (in-progress),退出码 4。pending 的 Report 可不经 claim 直接处理。
+        Decision 的 `result` 由 status 与 outcome 推出: rejected → rejected,rejected + superseded → superseded,as-proposed → approved,modified → modified。
+        `--session` 默认取环境变量 `CLAUDE_CODE_SESSION_ID`;都没有时 Decision 不记 `session`。
+        `action` 为 `resolve`;没有 `--instruction` 时 `note` 记 outcome 与 changes。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status, decided_by, by]
+              properties:
+                status: { type: string, enum: [resolved, rejected] }
+                decided_by: { type: string, minLength: 1 }
+                instruction: { type: string }
+                outcome: { $ref: "#/components/schemas/Outcome" }
+                changes: { type: array, items: { type: string } }
+                by: { type: string, minLength: 1 }
+                session: { type: string, minLength: 1 }
+      responses:
+        "200":
+          description: 更新后的 Report 与写入的 Decision
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [report, decision]
+                properties:
+                  report: { $ref: "#/components/schemas/Report" }
+                  decision: { $ref: "#/components/schemas/Decision" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /lessons:
+    post:
+      tags: [agent-write]
+      operationId: addLesson
+      summary: Capture 一条 Lesson,写入 shared/reference/lessons/<id>-<主题>.md,status 为 active
+      x-cli:
+        command: node-index lesson add --topic <主题> --client .. --situation .. --problem .. --fix .. [--host-only]
+      description: |
+        任何目录都可执行。`--host-only` 时 `host` 取 host/host.yml 的 `host`,否则为空。
+        主题进入文件名,不得含 `/`;正文三节依次为 情境、问题、正确做法。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [topic, client, situation, problem, fix]
+              properties:
+                topic: { type: string, minLength: 1, pattern: "^[^/]+$" }
+                client: { type: string, minLength: 1 }
+                situation: { type: string, minLength: 1 }
+                problem: { type: string, minLength: 1 }
+                fix: { type: string, minLength: 1 }
+                host_only: { type: boolean, default: false }
+      responses:
+        "201":
+          description: 新建的 Lesson
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Lesson" }
+        "400": { $ref: "#/components/responses/BadInput" }
+
+  /catalog:
+    get:
+      tags: [read]
+      operationId: listCatalog
+      summary: 列出 Catalog entry,按名称排序
+      x-cli:
+        command: node-index catalog list [--tier core|router|leaf] [--status active|retired]
+      parameters:
+        - name: tier
+          in: query
+          schema: { $ref: "#/components/schemas/Tier" }
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/EntryStatus" }
+      responses:
+        "200":
+          description: Catalog entry 列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CatalogEntry" }
+
+  /catalog/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    put:
+      tags: [write]
+      operationId: setCatalogEntry
+      summary: 修改或新建一条 Catalog entry
+      x-cli:
+        command: node-index catalog set <name> [--tier ..] [--manual-only true|false] [--status ..] [--entry .. --source .. [--version ..]]
+      description: |
+        entry 不存在时必须带 `--entry`、`--source`、`--tier`,`added` 取今天;否则退出码 3。
+        修改 `entry` 为 `native` 的条目,只允许改 `tier`、`manual_only`,其余退出码 5。至少改一个字段,否则退出码 2。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                entry: { $ref: "#/components/schemas/EntryKind" }
+                source: { type: string, minLength: 1 }
+                version: { type: [string, "null"] }
+                tier: { $ref: "#/components/schemas/Tier" }
+                manual_only: { type: boolean }
+                status: { $ref: "#/components/schemas/EntryStatus" }
+      responses:
+        "200":
+          description: 修改后的条目
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CatalogEntry" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /categories:
+    post:
+      tags: [write]
+      operationId: createCategory
+      summary: 新建 Category
+      x-cli:
+        command: node-index category new <id> --name .. [--router <skill>]
+      description: 父 Category 不存在退出码 3;id 已存在退出码 4。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, name]
+              properties:
+                id: { $ref: "#/components/schemas/CategoryId" }
+                name: { type: string, minLength: 1 }
+                router: { type: [string, "null"] }
+      responses:
+        "201":
+          description: 新建的 Category
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SharedCategory" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /categories/membership/move:
+    post:
+      tags: [write]
+      operationId: moveMember
+      summary: 把成员从一个 Category 移到另一个
+      x-cli:
+        command: node-index category move <member> --from <category> --to <category>
+      description: 成员不在 `--from` 中或 Category 不存在,退出码 3。已在 `--to` 中时只从 `--from` 移除 (幂等)。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [member, from, to]
+              properties:
+                member: { $ref: "#/components/schemas/MemberRef" }
+                from: { $ref: "#/components/schemas/CategoryId" }
+                to: { $ref: "#/components/schemas/CategoryId" }
+      responses:
+        "200":
+          description: 该成员现在所属的全部 Category
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Membership" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /categories/membership/copy:
+    post:
+      tags: [write]
+      operationId: copyMember
+      summary: 把成员加入另一个 Category,原有归属不变
+      x-cli:
+        command: node-index category copy <member> --to <category>
+      description: 已在其中时原样返回 (幂等)。Category 不存在退出码 3。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [member, to]
+              properties:
+                member: { $ref: "#/components/schemas/MemberRef" }
+                to: { $ref: "#/components/schemas/CategoryId" }
+      responses:
+        "200":
+          description: 该成员现在所属的全部 Category
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Membership" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /categories/membership/remove:
+    post:
+      tags: [write]
+      operationId: removeMember
+      summary: 把成员移出一个 Category
+      x-cli:
+        command: node-index category remove <member> --from <category>
+      description: 不在其中时原样返回 (幂等)。Category 不存在退出码 3。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [member, from]
+              properties:
+                member: { $ref: "#/components/schemas/MemberRef" }
+                from: { $ref: "#/components/schemas/CategoryId" }
+      responses:
+        "200":
+          description: 该成员现在所属的全部 Category
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Membership" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /maintenance/build:
+    post:
+      tags: [maintenance]
+      operationId: build
+      summary: 生成全部 Profile 到 build/,并把 Member list 渲染进各 Router skill
+      x-cli:
+        command: node-index build [--profile orchestrator|executor]
+      description: |
+        Shared config 校验失败时退出码 2,不写任何文件。内容未变的文件不重写 (`changed=false`):
+        规则文件按文件头之后的正文比较,所以未变时连文件头里的生成时间也不变。
+        `required-read` 块的正文须是 `task`、`sop` (、`fallback`) 映射;SOP 不存在且没有 fallback 时退出码 2。
+        Router skill 只覆盖 Member list 标记之间的区段;SKILL.md 缺少标记时退出码 2。
+      responses:
+        "200":
+          description: 生成结果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BuildResult" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /maintenance/activate:
+    post:
+      tags: [maintenance]
+      operationId: activate
+      summary: 按 host/host.yml 把各 Client 当前 Profile 的 Build 产物装进 Client
+      x-cli:
+        command: node-index activate [--client <name>]
+      description: |
+        规则文件复制写入 `rules_path` (原子替换,不用软链)。后缀为 `.mdc` 时在正文前加上
+        `alwaysApply: true` 的 frontmatter,重复执行结果仍相同。`rules_path` 是软链时拒绝 (退出码 4),
+        任何 Client 都不改: 写进去会改掉链接目标,由用户先换成普通文件。
+        skill 软链进 `skills_dir`,Manual-only skill 按 `manual_only_mode` 处理 (`frontmatter` 装成一个目录:
+        SKILL.md 是加了 `disable-model-invocation: true` 的副本,其余逐项软链到来源)。
+        只管自己装的条目 (记录在 `host/activate-state.json`);同名的其他文件不动,列入 `conflicts`。
+        Host 上没有的 skill 静默跳过并列入 `skipped`;Native skill 不装。`rules_path` 所在目录不存在的
+        Client 整个跳过,列入 `skipped_clients`。`build/<profile>/` 不存在时退出码 2。重复执行结果相同。
+      responses:
+        "200":
+          description: 激活结果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActivateResult" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /maintenance/apply:
+    post:
+      tags: [maintenance]
+      operationId: apply
+      summary: build → activate → commit → push,并把结果写入 host/ 下的状态文件
+      x-cli:
+        command: node-index apply [--no-push]
+      description: |
+        某一步失败即停在该步,不回滚已生效的配置,退出码 6。push 失败不算失败: `pushed=false`,退出码 0。
+        没有可提交的改动时跳过 commit (`commit` 为 null)。只提交 `shared/`。
+        每步结果写入 `host/apply-state.json` (形状同 ApplyStatus),供 `GET /api/apply/status`;
+        已有一次在运行 (状态为 running 且进程存活) 时退出码 4。
+      responses:
+        "200":
+          description: 各步结果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplyResult" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/Failed" }
+
+  /maintenance/digest:
+    post:
+      tags: [maintenance]
+      operationId: digest
+      summary: Digest 最小版,检查 Category 归类与 Router skill 的 Selection guide,每条发现写成一条 digest Report
+      x-cli:
+        command: node-index digest [--dry-run] [--if-due] [--workers N] [--env <file>]
+      description: |
+        两类检查,每个检查单位一次模型调用 (连接信息同 summarize,读仓库根 `.env`,密钥不出现在输出里):
+        `category-fit` 每个含 skill 成员的 Category 一个单位,判断其中每个 skill 的名字与内容是否符合该 Category 主题,
+        发现按 skill 拆开;`router-guide` 每个有 Router 的 Category 一个单位,判断 Selection guide 与当前 Member list
+        是否一致,模型给出修订稿时 Report 附 Proposal (`replace` 整段 Selection guide)。
+        每条发现经 `inbox` 写成 `kind: digest` 的 Report (`from.client` 为 `node-index-digest`),reason 含具体建议
+        (归类类给出 `category move|copy` 命令)。条目键写在 evidence 首行 `Digest 条目: <键>`
+        (`category-fit:<category>:<skill>`、`router-guide:<router>`);同一条目已有未关闭的 digest Report 时不新建,
+        列入 `duplicates`。模型回复不合格时带反馈重问,仍不合格列入 `failed`,命令仍退出 0。
+        全部单位成功时把运行时间记入 `host/digest-state.json`;`--if-due` 时距上次不满 7 天就跳过 (`skipped: true`)。
+        `--dry-run` 不需要 .env,不调用模型,不要求在维护目录内执行。host/host.yml 不存在时退出码 2。
+      parameters:
+        - { name: dry-run, in: query, schema: { type: boolean, default: false } }
+        - { name: if-due, in: query, schema: { type: boolean, default: false } }
+        - { name: workers, in: query, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: 运行结果;dry-run 返回 target_keys 与 sample_prompt;未到期返回 skipped
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  skipped: { type: boolean }
+                  next_due: { type: string }
+                  last_run: { type: [string, "null"] }
+                  targets: { type: integer }
+                  target_keys: { type: array, items: { type: string } }
+                  sample_prompt: { type: [string, "null"] }
+                  reports:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, key, title, proposal]
+                      properties:
+                        id: { $ref: "#/components/schemas/ReportId" }
+                        key: { type: string }
+                        title: { type: string }
+                        proposal: { type: boolean }
+                  duplicates: { type: array, items: { type: string } }
+                  failed:
+                    type: array
+                    items:
+                      type: object
+                      required: [key, reason]
+                      properties:
+                        key: { type: string }
+                        reason: { type: string }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ---- P3: 网页后端的 HTTP 接口 (ui 的 server.py,只监听 127.0.0.1)。这一组是真实 HTTP,不对应 CLI 命令 ----
+
+  /api/graph:
+    get:
+      tags: [http]
+      operationId: httpGraph
+      x-http: true
+      summary: Explore 页的图数据 (形状见 ui/console/README.md)
+      responses:
+        "200":
+          description: 节点与边
+          content:
+            application/json:
+              schema: { type: object }
+
+  /api/organize:
+    get:
+      tags: [http]
+      operationId: httpOrganize
+      x-http: true
+      summary: Category 树与成员,合并 categories.yaml、catalog.yaml 与 Index 层级摘要
+      responses:
+        "200":
+          description: Organize 页数据
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [categories, uncategorized]
+                properties:
+                  categories:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: "#/components/schemas/SharedCategory"
+                        - type: object
+                          required: [member_details]
+                          properties:
+                            member_details:
+                              type: array
+                              items: { $ref: "#/components/schemas/RouterMember" }
+                  uncategorized:
+                    type: array
+                    description: 不属于任何 Category 的 active Catalog entry 名称 (Router skill 除外)
+                    items: { type: string }
+                  entries:
+                    type: object
+                    description: 全部 Catalog entry,按名称索引,供成员行显示来源与 Manual-only
+                    additionalProperties: { $ref: "#/components/schemas/CatalogEntry" }
+                  recent:
+                    type: array
+                    description: |
+                      新归类的成员: 最近 7 天内由提交加进某 Category、现在仍在其中的成员。取自 categories.yaml 的 git log,
+                      跳过 apply 提交 (用户在网页上的改动经 apply 提交),所以剩下的是 agent 的归类。是否已看过由页面自己记。
+                    items:
+                      type: object
+                      required: [member, category, commit, at]
+                      properties:
+                        member: { $ref: "#/components/schemas/MemberRef" }
+                        category: { $ref: "#/components/schemas/CategoryId" }
+                        commit: { type: string }
+                        at: { type: string }
+                  problems:
+                    type: array
+                    description: shared.cross_check 的跨文件不一致
+                    items: { type: string }
+
+  /api/category:
+    post:
+      tags: [http]
+      operationId: httpCreateCategory
+      x-http: true
+      summary: 新建 Category,与 createCategory 同一函数
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, name]
+              properties:
+                id: { $ref: "#/components/schemas/CategoryId" }
+                name: { type: string, minLength: 1 }
+                router: { type: [string, "null"] }
+      responses:
+        "201":
+          description: 新建的 Category
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SharedCategory" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/category/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: "#/components/schemas/CategoryId" }
+    delete:
+      tags: [http]
+      operationId: httpDeleteCategory
+      x-http: true
+      summary: 删除空的 Category (catalog.delete_category);有成员或子 Category 时 409
+      responses:
+        "200":
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted: { $ref: "#/components/schemas/CategoryId" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/membership:
+    post:
+      tags: [http]
+      operationId: httpMembership
+      x-http: true
+      summary: 移动、复制、移出成员,与 moveMember / copyMember / removeMember 同一批函数
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [op, member]
+              properties:
+                op: { type: string, enum: [move, copy, remove] }
+                member: { $ref: "#/components/schemas/MemberRef" }
+                from: { $ref: "#/components/schemas/CategoryId" }
+                to: { $ref: "#/components/schemas/CategoryId" }
+      responses:
+        "200":
+          description: 该成员现在所属的全部 Category
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Membership" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/catalog/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    patch:
+      tags: [http]
+      operationId: httpPatchCatalog
+      x-http: true
+      summary: 改 Tier、Manual-only,与 setCatalogEntry 同一函数
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                tier: { $ref: "#/components/schemas/Tier" }
+                manual_only: { type: boolean }
+      responses:
+        "200":
+          description: 修改后的条目
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CatalogEntry" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/profiles:
+    get:
+      tags: [http]
+      operationId: httpProfiles
+      x-http: true
+      summary: 激活表与各 Profile 预览 (含估算大小)
+      responses:
+        "200":
+          description: Profiles 页数据
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [clients, profiles]
+                properties:
+                  clients:
+                    type: array
+                    items:
+                      type: object
+                      required: [client, profile, rules_path, skills_dir, installed, active_profile, current_bytes]
+                      properties:
+                        client: { type: string }
+                        profile: { $ref: "#/components/schemas/Profile" }
+                        rules_path: { type: string }
+                        skills_dir: { type: string }
+                        installed: { type: boolean, description: rules_path 所在目录存在;否则页面显示「本机未安装」(与 activate 跳过的判断相同) }
+                        active_profile: { type: [string, "null"], description: rules_path 文件头里 build 写下的 profile,即 Client 实际在用的;读不出为 null }
+                        current_bytes: { type: [integer, "null"], description: rules_path 现在的大小 }
+                  profiles:
+                    type: array
+                    items:
+                      type: object
+                      required: [profile, rules_bytes, skills, rules, error]
+                      properties:
+                        profile: { $ref: "#/components/schemas/Profile" }
+                        rules_bytes: { type: integer, description: 按当前 Shared config 估算的规则文件大小 (与 build 同一渲染函数) }
+                        error: { type: [string, "null"], description: 渲染失败的原因,此时 rules_bytes 为 0 }
+                        skills: { type: array, items: { $ref: "#/components/schemas/ProfileSkill" } }
+                        rules:
+                          type: array
+                          description: 该 Profile 包含的 Rule block
+                          items:
+                            type: object
+                            required: [id, title, kind, order, bytes]
+                            properties:
+                              id: { $ref: "#/components/schemas/Slug" }
+                              title: { type: string }
+                              kind: { type: string, enum: [general, index, required-read, dispatch, maintenance] }
+                              order: { type: integer }
+                              bytes: { type: integer }
+
+  /api/clients/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    patch:
+      tags: [http]
+      operationId: httpPatchClient
+      x-http: true
+      summary: 切换某 Client 的 Profile (写 host/host.yml,不自动 activate)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [profile]
+              properties:
+                profile: { $ref: "#/components/schemas/Profile" }
+      responses:
+        "200":
+          description: 修改后的 Client
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [client, profile]
+                properties:
+                  client: { type: string }
+                  profile: { $ref: "#/components/schemas/Profile" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/inbox:
+    get:
+      tags: [http]
+      operationId: httpListInbox
+      x-http: true
+      summary: 与 listInbox 相同,查询参数 status (可重复)、kind;每项另带 proposal (是否带 change)
+      responses:
+        "200":
+          description: Report 摘要列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  allOf:
+                    - $ref: "#/components/schemas/ReportBrief"
+                    - type: object
+                      required: [proposal]
+                      properties:
+                        proposal: { type: boolean }
+
+  /api/inbox/{reportId}:
+    parameters:
+      - $ref: "#/components/parameters/ReportId"
+    get:
+      tags: [http]
+      operationId: httpShowReport
+      x-http: true
+      summary: 与 showReport 相同
+      responses:
+        "200":
+          description: Report
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Report" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/inbox/{reportId}/preview:
+    parameters:
+      - $ref: "#/components/parameters/ReportId"
+    get:
+      tags: [http]
+      operationId: httpPreviewReport
+      x-http: true
+      summary: Proposal 的改动预览
+      description: |
+        在临时目录里对目标文件的副本运行 inbox.apply_change (与批准同一函数),源文件不动。
+        不匹配时 conflict 为原因。目标是 shared/categories.yaml 时 trees 给出前后两棵 Category 树。不是 Proposal 时各字段为 null。
+      responses:
+        "200":
+          description: 预览
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [target, before, after, conflict, trees]
+                properties:
+                  target: { type: [string, "null"] }
+                  before: { type: [string, "null"] }
+                  after: { type: [string, "null"] }
+                  conflict: { type: [string, "null"] }
+                  trees:
+                    oneOf:
+                      - type: "null"
+                      - type: object
+                        required: [before, after]
+                        properties:
+                          before: { type: array, items: { $ref: "#/components/schemas/SharedCategory" } }
+                          after: { type: array, items: { $ref: "#/components/schemas/SharedCategory" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/inbox/{reportId}/instruction:
+    parameters:
+      - $ref: "#/components/parameters/ReportId"
+    post:
+      tags: [http]
+      operationId: httpCopyInstruction
+      x-http: true
+      summary: 「复制指令」的文字,即 inbox.copy_instruction(id, text);不改任何文件
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                text: { type: string }
+      responses:
+        "200":
+          description: 指令
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [instruction]
+                properties:
+                  instruction: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/inbox/{reportId}/decide:
+    parameters:
+      - $ref: "#/components/parameters/ReportId"
+    post:
+      tags: [http]
+      operationId: httpDecideReport
+      x-http: true
+      summary: 用户在网页上直接批准或驳回,与 resolveReport 同一函数 (decided_by=user, outcome=as-proposed)
+      description: |
+        实现为 `node_index.inbox.decide(paths, id, decision, instruction)`,HTTP 层只做参数转换。
+        **批准会应用 change**: Report 带 change 时,先把改动写进工作区的目标文件,再记 resolved / as-proposed,`resolution.changes` 为 `[target]`。
+        `replace` 要求 `old` 在目标文件中恰好出现 1 次;`diff` 经 `git apply --check` 后应用 (只许改 target 一个文件,diff 头里的路径一律按 target 处理)。
+        目标文件已变、不再匹配时返回 409,目标文件与 Report 都不改。之后的 Build / Activate 由「应用」完成,decide 不触发。
+        驳回时 `instruction` 即理由,必填,否则 400。已是 resolved/rejected 返回 409;in-progress 的 Report 也可直接决定 (用户的决定优先于 agent 的认领)。
+        Decision 的 `action` 为 `decide`,`by` 与 `decided_by` 都是 `user`。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [approve, reject] }
+                instruction: { type: string }
+      responses:
+        "200":
+          description: 更新后的 Report 与写入的 Decision
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [report, decision]
+                properties:
+                  report: { $ref: "#/components/schemas/Report" }
+                  decision: { $ref: "#/components/schemas/Decision" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/changes:
+    get:
+      tags: [http]
+      operationId: httpChanges
+      x-http: true
+      summary: 未应用改动,即 Git 工作区相对上次 apply 提交的差异
+      responses:
+        "200":
+          description: 改动文件列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [base_commit, files]
+                properties:
+                  base_commit: { type: [string, "null"], description: 上次 apply 结束时的 HEAD (apply_status 的 head);从未 apply 为 null,此时对比当前 HEAD }
+                  files:
+                    type: array
+                    items:
+                      type: object
+                      required: [path, status]
+                      properties:
+                        path: { type: string }
+                        status: { type: string, enum: [added, modified, deleted] }
+                  clients:
+                    type: array
+                    description: host/host.yml 里 Profile 已改、尚未 activate 的 Client (host/ 不进 Git,单独算;未安装的不列)
+                    items:
+                      type: object
+                      required: [client, profile, active_profile]
+                      properties:
+                        client: { type: string }
+                        profile: { $ref: "#/components/schemas/Profile" }
+                        active_profile: { type: [string, "null"] }
+
+  /api/changes/discard:
+    post:
+      tags: [http]
+      operationId: httpDiscardChanges
+      x-http: true
+      summary: 撤销未应用改动,把 shared/ 恢复到上次 apply 的提交
+      description: 未跟踪的新文件删除;Profile 已改的 Client 改回它正在用的 Profile,记为 `host/host.yml#<client>`。应用期间 409。
+      responses:
+        "200":
+          description: 被恢复的文件
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [discarded]
+                properties:
+                  discarded: { type: array, items: { type: string } }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/lessons:
+    get:
+      tags: [http]
+      operationId: httpLessons
+      x-http: true
+      summary: 全部 Lesson,含正文三节,新的在前
+      responses:
+        "200":
+          description: Lesson 列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/LessonFull" }
+    post:
+      tags: [http]
+      operationId: httpLessonCreate
+      x-http: true
+      summary: 新建 Lesson,与 `lesson add` 同一函数
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [topic, client, situation, problem, fix]
+              properties:
+                topic: { type: string }
+                client: { type: string }
+                situation: { type: string }
+                problem: { type: string }
+                fix: { type: string }
+                host_only: { type: boolean, description: true 时 host 记为本机 Host id }
+      responses:
+        "201":
+          description: 新建的 Lesson
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LessonFull" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/lessons/{lessonId}:
+    patch:
+      tags: [http]
+      operationId: httpLessonUpdate
+      x-http: true
+      summary: 改一条 Lesson。id、host、date 不变;改主题会改文件名;status 不是 merged 时 merged_into 清空
+      parameters:
+        - { name: lessonId, in: path, required: true, schema: { $ref: "#/components/schemas/LessonId" } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                topic: { type: string }
+                client: { type: string }
+                situation: { type: string }
+                problem: { type: string }
+                fix: { type: string }
+                status: { $ref: "#/components/schemas/LessonStatus" }
+                merged_into: { type: [string, "null"] }
+      responses:
+        "200":
+          description: 改后的 Lesson
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LessonFull" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/decisions:
+    get:
+      tags: [http]
+      operationId: httpDecisions
+      x-http: true
+      summary: Decision log 全部记录,新的在前
+      responses:
+        "200":
+          description: Decision 列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Decision" }
+
+  /api/apply:
+    post:
+      tags: [http]
+      operationId: httpApply
+      x-http: true
+      summary: 在后台线程启动 apply (push 到 origin);已有一次在跑时返回 409
+      description: 应用期间其余写接口一律 409「正在应用」。
+      responses:
+        "202":
+          description: 已启动
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplyStatus" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/apply/status:
+    get:
+      tags: [http]
+      operationId: httpApplyStatus
+      x-http: true
+      summary: 轮询当前步骤与结果
+      responses:
+        "200":
+          description: 当前状态
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplyStatus" }
+
+components:
+  parameters:
+    NodeId:
+      name: id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/NodeId" }
+    Actor:
+      name: actor
+      in: query
+      required: true
+      description: 声明调用者是人还是 AI。用于摘要来源与手工边的保护规则,属于自我声明,不是安全边界。
+      schema: { $ref: "#/components/schemas/Actor" }
+
+    ReportId:
+      name: reportId
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/ReportId" }
+
+  schemas:
+    NodeId:
+      type: string
+      pattern: "^n[0-9]+$"
+      description: 显示形式的节点编号;编号来自自增整数,删除后不复用。
+      examples: [n12]
+    Category:
+      type: string
+      enum: [Reference, Knowledge, Project, Skill]
+    Actor:
+      type: string
+      enum: [human, ai]
+    PathKind:
+      type: string
+      enum: [file, dir]
+    PathState:
+      type: string
+      enum: [ok, missing]
+    Edge:
+      type: object
+      required: [parent, child, origin]
+      properties:
+        parent: { $ref: "#/components/schemas/NodeId" }
+        child: { $ref: "#/components/schemas/NodeId" }
+        origin:
+          type: string
+          enum: [scan, manual]
+    EdgeRef:
+      type: object
+      required: [parent, child, actor]
+      properties:
+        parent: { $ref: "#/components/schemas/NodeId" }
+        child: { $ref: "#/components/schemas/NodeId" }
+        actor: { $ref: "#/components/schemas/Actor" }
+    NodeBrief:
+      type: object
+      required: [id, name, category, hier_summary, mounted, path_state]
+      properties:
+        id: { $ref: "#/components/schemas/NodeId" }
+        name: { type: string, minLength: 1 }
+        category: { $ref: "#/components/schemas/Category" }
+        hier_summary: { type: string, maxLength: 40 }
+        mounted:
+          type: boolean
+          description: 是否有挂载物 (对应树里的 📎)
+        path_state: { $ref: "#/components/schemas/PathState" }
+    SearchHit:
+      allOf:
+        - $ref: "#/components/schemas/NodeBrief"
+        - type: object
+          required: [roots]
+          properties:
+            roots:
+              type: array
+              description: 该节点向上能到达的所有最上层节点 (没有父节点的节点),去重
+              items:
+                type: object
+                required: [id, name]
+                properties:
+                  id: { $ref: "#/components/schemas/NodeId" }
+                  name: { type: string }
+    Node:
+      allOf:
+        - $ref: "#/components/schemas/NodeBrief"
+        - type: object
+          required: [content_summary, path, path_kind, status, created_at, modified_at, pending, path_checked_at, hier_by, content_by, hits, last_access, parents]
+          properties:
+            content_summary:
+              type: [string, "null"]
+              maxLength: 200
+              description: 仅有挂载物的节点可非空
+            path:
+              type: [string, "null"]
+              description: 挂载物的绝对路径;全库唯一
+            path_kind:
+              oneOf:
+                - { $ref: "#/components/schemas/PathKind" }
+                - { type: "null" }
+            status: { type: [string, "null"] }
+            created_at: { type: string, description: "本地时间,格式 YYYY-MM-DDTHH:MM:SS,不含时区" }
+            modified_at: { type: string, description: "同 created_at" }
+            pending: { type: boolean }
+            path_checked_at: { type: [string, "null"], description: "同 created_at" }
+            hier_by:
+              oneOf:
+                - { $ref: "#/components/schemas/Actor" }
+                - { type: "null" }
+            content_by:
+              oneOf:
+                - { $ref: "#/components/schemas/Actor" }
+                - { type: "null" }
+            hits:
+              type: integer
+              minimum: 0
+              description: 被 agent 读取 (get / children / ancestors) 的累计次数,是并入 (ingest-access) 后的值,不含本次读取。运行遥测,不进快照,写命令不改它
+            last_access: { type: [string, "null"], description: "最近一次被读取的时间,同 created_at;从未被读取为 null" }
+            parents:
+              type: array
+              items: { $ref: "#/components/schemas/Edge" }
+    NodeCreate:
+      type: object
+      required: [name, category, actor]
+      properties:
+        name: { type: string, minLength: 1 }
+        category: { $ref: "#/components/schemas/Category" }
+        hier_summary: { type: string, maxLength: 40 }
+        path: { type: string }
+        status: { type: string }
+        parents:
+          type: array
+          items: { $ref: "#/components/schemas/NodeId" }
+        actor: { $ref: "#/components/schemas/Actor" }
+    NodeUpdate:
+      type: object
+      minProperties: 2
+      required: [actor]
+      properties:
+        name: { type: string, minLength: 1 }
+        category: { $ref: "#/components/schemas/Category" }
+        hier_summary: { type: string, maxLength: 40 }
+        content_summary: { type: string, maxLength: 200 }
+        status: { type: [string, "null"] }
+        path: { type: string }
+        actor: { $ref: "#/components/schemas/Actor" }
+    TreeNode:
+      type: object
+      required: [id, name, hier_summary, mounted, path_state, children]
+      properties:
+        id: { $ref: "#/components/schemas/NodeId" }
+        name: { type: string }
+        hier_summary: { type: string, maxLength: 40 }
+        mounted: { type: boolean }
+        path_state: { $ref: "#/components/schemas/PathState" }
+        see:
+          oneOf:
+            - { $ref: "#/components/schemas/NodeId" }
+            - { type: "null" }
+          description: 非空表示这是引用行,值是规范父节点的 id,该节点的完整子树在那个父节点下展开,children 为空
+        children:
+          type: array
+          items: { $ref: "#/components/schemas/TreeNode" }
+    Coverage:
+      type: object
+      required: [nodes, pending, missing, uncovered, stale_content_summaries]
+      properties:
+        nodes: { type: integer }
+        pending: { type: integer, description: 待确认节点数 }
+        missing: { type: integer, description: 路径失效节点数 }
+        uncovered:
+          type: array
+          description: 范围内、深度以内,既没有节点挂载也未被排除的路径。为空即满足验收第 1 条。
+          items: { type: string }
+        stale_content_summaries:
+          type: integer
+          description: 挂载物修改时间晚于摘要记录时间的节点数
+    # ---- P3 ----
+    ReportId:
+      type: string
+      pattern: "^R-[0-9]{8}-[0-9a-f]{4}$"
+      examples: [R-20200101-a3f9]
+    LessonId:
+      type: string
+      pattern: "^L-[0-9]{8}-[0-9a-f]{4}$"
+      examples: [L-20200101-0b7c]
+    Slug:
+      type: string
+      pattern: "^[a-z0-9]+(-[a-z0-9]+)*$"
+      description: Rule block、SOP 的 id
+    CategoryId:
+      type: string
+      pattern: "^[a-z0-9]+(-[a-z0-9]+)*(/[a-z0-9]+(-[a-z0-9]+)*)*$"
+      examples: [design, design/motion]
+    MemberRef:
+      type: string
+      minLength: 1
+      description: "skill 名、sop:<id> 或 lesson:<id>"
+      examples: [demo-skill, "sop:demo-sop", "lesson:L-20200101-0a1b"]
+    ReportKind:
+      type: string
+      enum: [rule-change, index-issue, skill-issue, context-gap, other, digest]
+    ReportStatus:
+      type: string
+      enum: [pending, in-progress, resolved, rejected]
+    Position:
+      type: string
+      enum: [orchestrator, executor]
+    Profile:
+      type: string
+      enum: [orchestrator, executor]
+      description: 目前 Profile 与 Position 一一对应
+    Outcome:
+      type: string
+      enum: [as-proposed, modified, superseded]
+    DecisionResult:
+      type: string
+      enum: [approved, rejected, adopted, dismissed, modified, superseded]
+      description: 依次对应 批准、驳回、采纳、否决、按意见修改、已取代
+    Tier:
+      type: string
+      enum: [core, router, leaf]
+    EntryKind:
+      type: string
+      enum: [vendored, referenced, native]
+    EntryStatus:
+      type: string
+      enum: [active, retired]
+    LessonStatus:
+      type: string
+      enum: [active, merged, obsolete]
+    ReportChange:
+      type: object
+      required: [target]
+      description: diff 与 replace 二者恰好有一个
+      properties:
+        target: { type: string, minLength: 1, description: 仓库内相对路径 }
+        diff: { type: string, minLength: 1, description: 统一 diff }
+        replace:
+          type: object
+          required: [old, new]
+          properties:
+            old: { type: string }
+            new: { type: string }
+      oneOf:
+        - required: [diff]
+        - required: [replace]
+    ReportResolution:
+      type: object
+      required: [decided_by, instruction, outcome, changes, at]
+      properties:
+        decided_by: { type: string, minLength: 1 }
+        instruction: { type: [string, "null"], description: 用户原话 }
+        outcome:
+          oneOf:
+            - { $ref: "#/components/schemas/Outcome" }
+            - { type: "null" }
+          description: status 为 rejected 时为 null 或 superseded
+        changes: { type: array, items: { type: string } }
+        at: { type: string, description: "本地时间 ISO 8601" }
+    ReportBrief:
+      type: object
+      required: [id, kind, title, status, at, claimed_by, decided_by]
+      properties:
+        id: { $ref: "#/components/schemas/ReportId" }
+        kind: { $ref: "#/components/schemas/ReportKind" }
+        title: { type: string }
+        status: { $ref: "#/components/schemas/ReportStatus" }
+        at: { type: string }
+        claimed_by: { type: [string, "null"] }
+        decided_by: { type: [string, "null"], description: 关闭后为 resolution.decided_by,未关闭为 null }
+    Report:
+      type: object
+      required: [id, kind, title, reason, evidence, from, at, change, status, claimed_by, resolution]
+      properties:
+        id: { $ref: "#/components/schemas/ReportId" }
+        kind: { $ref: "#/components/schemas/ReportKind" }
+        title: { type: string, minLength: 1 }
+        reason: { type: string, minLength: 1 }
+        evidence: { type: string, minLength: 1 }
+        from:
+          type: object
+          required: [client, position, host]
+          properties:
+            client: { type: string, minLength: 1 }
+            position: { $ref: "#/components/schemas/Position" }
+            host: { type: string, minLength: 1 }
+        at: { type: string, description: "本地时间 ISO 8601" }
+        change:
+          oneOf:
+            - { $ref: "#/components/schemas/ReportChange" }
+            - { type: "null" }
+        status: { $ref: "#/components/schemas/ReportStatus" }
+        claimed_by: { type: [string, "null"] }
+        resolution:
+          oneOf:
+            - { $ref: "#/components/schemas/ReportResolution" }
+            - { type: "null" }
+    Decision:
+      type: object
+      required: [at, target, action, result, by]
+      description: shared/decisions.jsonl 的一行;instruction 与 note 至少一个
+      properties:
+        at: { type: string }
+        target: { type: string, minLength: 1, description: Report id 或 Digest 条目 }
+        action: { type: string, minLength: 1 }
+        result: { $ref: "#/components/schemas/DecisionResult" }
+        instruction: { type: string }
+        note: { type: string }
+        by: { type: string, minLength: 1, description: 执行者;做决定的人见 Report 的 resolution.decided_by }
+        session: { type: string, minLength: 1, description: 执行者的会话 id,拿得到才记 }
+      anyOf:
+        - required: [instruction]
+        - required: [note]
+    Lesson:
+      type: object
+      required: [id, path, status, merged_into, host, client, date]
+      properties:
+        id: { $ref: "#/components/schemas/LessonId" }
+        path: { type: string, description: 仓库内相对路径 }
+        status: { $ref: "#/components/schemas/LessonStatus" }
+        merged_into: { type: [string, "null"] }
+        host: { type: [string, "null"] }
+        client: { type: string }
+        date: { type: string, format: date }
+    LessonFull:
+      allOf:
+        - { $ref: "#/components/schemas/Lesson" }
+        - type: object
+          required: [topic, situation, problem, fix]
+          properties:
+            topic: { type: string, minLength: 1 }
+            situation: { type: string, description: 正文「情境」一节 }
+            problem: { type: string, description: 正文「问题」一节 }
+            fix: { type: string, description: 正文「正确做法」一节 }
+    CatalogEntry:
+      type: object
+      required: [name, entry, source, version, added, tier, manual_only, status]
+      properties:
+        name: { type: string, minLength: 1 }
+        entry: { $ref: "#/components/schemas/EntryKind" }
+        source: { type: string, minLength: 1 }
+        version: { type: [string, "null"] }
+        added: { type: string, format: date }
+        tier: { $ref: "#/components/schemas/Tier" }
+        manual_only: { type: boolean }
+        status: { $ref: "#/components/schemas/EntryStatus" }
+    SharedCategory:
+      type: object
+      description: shared/categories.yaml 中的一个 Category (不同于节点的类别 Category)
+      required: [id, name, router, members]
+      properties:
+        id: { $ref: "#/components/schemas/CategoryId" }
+        name: { type: string, minLength: 1 }
+        router: { type: [string, "null"] }
+        members: { type: array, items: { $ref: "#/components/schemas/MemberRef" } }
+    Membership:
+      type: object
+      required: [member, categories]
+      properties:
+        member: { $ref: "#/components/schemas/MemberRef" }
+        categories: { type: array, items: { $ref: "#/components/schemas/CategoryId" } }
+    RouterMember:
+      type: object
+      required: [ref, kind, tier, trait]
+      description: Router skill 的 members.yaml 每一项
+      properties:
+        ref: { $ref: "#/components/schemas/MemberRef" }
+        kind: { type: string, enum: [skill, sop, lesson] }
+        tier:
+          oneOf:
+            - { $ref: "#/components/schemas/Tier" }
+            - { type: "null" }
+          description: 只有 skill 有
+        trait: { type: string, maxLength: 40 }
+    ProfileSkill:
+      type: object
+      required: [name, manual_only]
+      properties:
+        name: { type: string }
+        manual_only: { type: boolean }
+        tier: { $ref: "#/components/schemas/Tier" }
+    BuildResult:
+      type: object
+      required: [profiles, routers]
+      properties:
+        profiles:
+          type: array
+          items:
+            type: object
+            required: [profile, rules_path, bytes, skills, changed]
+            properties:
+              profile: { $ref: "#/components/schemas/Profile" }
+              rules_path: { type: string }
+              bytes: { type: integer }
+              skills: { type: array, items: { $ref: "#/components/schemas/ProfileSkill" } }
+              changed: { type: boolean }
+        routers:
+          type: array
+          items:
+            type: object
+            required: [name, members, changed]
+            properties:
+              name: { type: string }
+              members: { type: integer }
+              changed: { type: boolean }
+    ActivateResult:
+      type: object
+      required: [clients, skipped_clients]
+      properties:
+        clients:
+          type: array
+          items:
+            type: object
+            required: [client, profile, rules_path, rules_changed, linked, unlinked, skipped, conflicts]
+            properties:
+              client: { type: string }
+              profile: { $ref: "#/components/schemas/Profile" }
+              rules_path: { type: string }
+              rules_changed: { type: boolean }
+              linked: { type: array, items: { type: string } }
+              unlinked: { type: array, items: { type: string } }
+              skipped: { type: array, items: { type: string }, description: Host 上没有的 skill }
+              conflicts: { type: array, items: { type: string }, description: skills_dir 里已有不归 activate 管的同名文件,未覆盖 }
+        skipped_clients:
+          type: array
+          items:
+            type: object
+            required: [client, reason]
+            properties:
+              client: { type: string }
+              reason: { type: string }
+    ApplyStep:
+      type: object
+      required: [step, ok, detail]
+      properties:
+        step: { type: string, enum: [build, activate, commit, push] }
+        ok: { type: boolean }
+        detail: { type: string }
+    ApplyResult:
+      type: object
+      required: [steps, commit, pushed]
+      properties:
+        steps: { type: array, items: { $ref: "#/components/schemas/ApplyStep" } }
+        commit: { type: [string, "null"] }
+        pushed: { type: boolean }
+        unpushed_reason: { type: [string, "null"], description: 未推送的原因;推送成功为 null }
+    ApplyStatus:
+      type: object
+      required: [state, steps, commit, pushed, at]
+      properties:
+        state: { type: string, enum: [idle, running, done, failed] }
+        steps: { type: array, items: { $ref: "#/components/schemas/ApplyStep" } }
+        commit: { type: [string, "null"] }
+        pushed: { type: boolean }
+        at: { type: [string, "null"] }
+        unpushed_reason: { type: [string, "null"], description: 非空即「未推送」 }
+        head: { type: [string, "null"], description: apply 结束时的 HEAD,即 /api/changes 的 base_commit }
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          enum: [bad_input, not_found, conflict, forbidden, failed]
+        message: { type: string }
+
+  responses:
+    BadInput:
+      description: 参数不合法,包括摘要超长、搜索词为空、路径不存在 (退出码 2)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: 节点或边不存在 (退出码 3)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: 成环、路径已被其他节点挂载、ai 覆盖 human 摘要、节点仍有边 (退出码 4)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: 不在维护目录内执行写命令,或 ai 执行被禁止的动作 (退出码 5)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Failed:
+      description: 外部步骤失败,如 apply 中 build、activate 或 git commit 失败 (退出码 6)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }

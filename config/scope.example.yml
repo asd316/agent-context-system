@@ -1,0 +1,15 @@
+# 收录范围清单的字段示例。真实的共享规则在 config/scope.yml (进 Git),本机路径在 host/host.yml 的 scan_roots。
+# 清单之外全部收录;exclude 用 gitignore 语法。host_roots: true 时把 Host config 的 scan_roots 接在 roots 之后。
+
+global_exclude:
+  - .git
+  - node_modules
+  - .DS_Store
+
+roots:
+  - path: ~/Documents/notes
+    category: Knowledge      # Reference | Knowledge | Project | Skill
+    depth: 1                # 向下扫描几层文件夹
+    include_files: false    # true 时到 Markdown 文件层级(如个人资料)
+    exclude:
+      - projects/exported-*

@@ -1,0 +1,18 @@
+# 收录范围清单: 各 Host 共享的扫描规则。清单之外全部收录;exclude 用 gitignore 语法的子集。
+# 本机路径 (Skill 中心库、项目、知识库) 不在这里,在 host/host.yml 的 scan_roots;
+# host_roots: true 表示把它们接在下面的 roots 之后。字段说明见 scope.example.yml。
+
+global_exclude:
+  - .git
+  - node_modules
+  - .DS_Store
+
+host_roots: false
+
+roots:
+- path: ~/Documents/notes    # 换成你的笔记目录
+  category: Knowledge        # Reference | Knowledge | Project | Skill
+  depth: 1
+- path: ~/code               # 换成你的项目目录
+  category: Project
+  depth: 1

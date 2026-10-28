@@ -1,0 +1,37 @@
+#!/bin/sh
+# Sync: 拉取 Shared config;HEAD 变了才 Build + Activate。
+# 失败只写日志 (不回滚、不重试),已生效的配置保持原样;下次触发再试。由 launchd 定时调用。
+#   NODE_INDEX_REPO     Shared config 所在仓库,默认本脚本所在仓库
+#   NODE_INDEX_PYTHON   带 PyYAML 的 Python 3.11+,默认 python3
+#   NODE_INDEX_SYNC_LOG 日志文件,默认 ~/Library/Logs/NodeIndex/sync.log
+#   NODE_INDEX_DB       Index 数据库 (build 取树用),默认同 node-index
+set -u
+
+BIN_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO=${NODE_INDEX_REPO:-$(dirname "$BIN_DIR")}
+PY=${NODE_INDEX_PYTHON:-python3}
+LOG=${NODE_INDEX_SYNC_LOG:-$HOME/Library/Logs/NodeIndex/sync.log}
+mkdir -p "$(dirname "$LOG")"
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >> "$LOG"; }
+
+# 写命令只能在仓库内执行
+cd "$REPO" || { log "FAIL cd $REPO"; exit 1; }
+
+before=$(git rev-parse HEAD 2>/dev/null)
+if ! out=$(git pull --ff-only --quiet 2>&1); then
+  log "FAIL pull: $(printf '%s' "$out" | tail -n 1)"
+  exit 1
+fi
+after=$(git rev-parse HEAD 2>/dev/null)
+[ "$before" = "$after" ] && exit 0
+
+log "pulled ${before:-none}..$after"
+for step in build activate; do
+  if out=$("$PY" "$BIN_DIR/node-index" "$step" 2>&1); then
+    log "ok $step"
+  else
+    log "FAIL $step: $(printf '%s' "$out" | tail -n 1)"
+    exit 1
+  fi
+done
